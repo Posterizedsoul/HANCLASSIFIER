@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
+
+#!/usr/bin/env python3
 """
 HAN (Hierarchical Attention Network) Classifier for CWE Data
 Converted from Jupyter notebook: Copy_of_HAN20242lables.ipynb
 """
+
+# Force CPU-only mode to avoid GPU errors
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# Suppress TensorFlow logging except for errors
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 # Import necessary libraries
 import tensorflow as tf
@@ -38,6 +47,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix
 from tensorflow.keras.preprocessing.text import Tokenizer, text_to_word_sequence
 
+
 # Optional: Download necessary NLTK data: works better in some cases but not on this one
 # Uncomment the following line if needed
 # nltk.download('stopwords')
@@ -46,26 +56,50 @@ from tensorflow.keras.preprocessing.text import Tokenizer, text_to_word_sequence
 # Load data
 def load_data(filepath):
     """
-    Load the CWE data from a pickle file
+    Load the CWE data from a pickle or CSV file
 
     Args:
-        filepath: Path to the pickle file
+        filepath: Path to the data file
 
     Returns:
         DataFrame containing the CWE data
     """
     try:
-        with open(filepath, "rb") as f:
-            cwe_data = pickle.load(f)
-        print("Data loaded successfully!")
+        # Try if it's a CSV file
+        if filepath.endswith(".csv"):
+            cwe_data = pd.read_csv(filepath)
+            print("Data loaded successfully from CSV!")
+            print(cwe_data.head())
+            return cwe_data
+
+        # Try standard pickle loading
+        cwe_data = pd.read_pickle(filepath)
+        print("Data loaded successfully from pickle!")
         print(cwe_data.head())
         return cwe_data
-    except FileNotFoundError:
-        print(f"File not found: {filepath}")
-        return None
     except Exception as e:
-        print(f"Error loading data: {e}")
-        return None
+        print(f"Standard loading failed: {e}")
+        try:
+            # Fallback to a more robust loading method
+            with open(filepath, "rb") as f:
+                import pickle
+
+                raw_data = pickle.load(f)
+
+            # If it's already a DataFrame, use it
+            if isinstance(raw_data, pd.DataFrame):
+                cwe_data = raw_data
+            else:
+                # Otherwise try to construct a DataFrame
+                cwe_data = pd.DataFrame(raw_data)
+
+            print("Data loaded using fallback method!")
+            print(cwe_data.head())
+            return cwe_data
+        except Exception as e2:
+            print(f"Fallback loading failed: {e2}")
+            print("Please convert your data to CSV format for more reliable loading.")
+            return None
 
 
 def preprocess_data(cwe_data):
@@ -118,6 +152,13 @@ def preprocess_data(cwe_data):
 
     print(f"After preprocessing: {cwe_df.shape[0]} records")
     print(f"Unique labels: {cwe_df['common_consequences_scope'].unique()}")
+
+    # Save in CSV format for more reliable future loading
+    try:
+        cwe_df.to_csv("cwe_clean2.csv", index=False)
+        print("Data saved to CSV for future use")
+    except Exception as e:
+        print(f"Error saving CSV: {e}")
 
     return cwe_df
 
@@ -198,16 +239,19 @@ def build_han_model(
     """
     # Word level
     word_input = Input(shape=(max_sent_len,), dtype="int32")
-    word_embedding = Embedding(
-        input_dim=max_words, output_dim=embedding_dim, input_length=max_sent_len
-    )(word_input)
+    word_embedding = Embedding(input_dim=max_words, output_dim=embedding_dim)(
+        word_input
+    )
     word_lstm = Bidirectional(LSTM(lstm_units, return_sequences=True))(word_embedding)
     word_dense = TimeDistributed(Dense(lstm_units * 2, activation="relu"))(word_lstm)
     word_att = TimeDistributed(Dense(1, activation="tanh"))(word_dense)
     word_att = Flatten()(word_att)
-    word_att = tf.keras.activations.softmax(word_att)
-    word_att = tf.reshape(word_att, [-1, max_sent_len, 1])
-    word_output = tf.reduce_sum(word_lstm * word_att, axis=1)
+    word_att = tf.keras.layers.Activation("softmax")(word_att)
+    word_att = tf.keras.layers.Reshape((max_sent_len, 1))(word_att)
+    word_output = tf.keras.layers.Multiply()([word_lstm, word_att])
+    word_output = tf.keras.layers.Lambda(lambda x: tf.keras.backend.sum(x, axis=1))(
+        word_output
+    )
 
     # Sentence level model
     sent_encoder = Model(word_input, word_output)
@@ -223,9 +267,12 @@ def build_han_model(
     )
     document_att = TimeDistributed(Dense(1, activation="tanh"))(document_dense)
     document_att = Flatten()(document_att)
-    document_att = tf.keras.activations.softmax(document_att)
-    document_att = tf.reshape(document_att, [-1, max_sent, 1])
-    document_output = tf.reduce_sum(document_lstm * document_att, axis=1)
+    document_att = tf.keras.layers.Activation("softmax")(document_att)
+    document_att = tf.keras.layers.Reshape((max_sent, 1))(document_att)
+    document_output = tf.keras.layers.Multiply()([document_lstm, document_att])
+    document_output = tf.keras.layers.Lambda(lambda x: tf.keras.backend.sum(x, axis=1))(
+        document_output
+    )
 
     # Output layer
     output = Dense(2, activation="sigmoid")(document_output)
@@ -293,7 +340,10 @@ def train_model(model, X_data, y_data, epochs=10, batch_size=32, validation_spli
 
 
 def save_model(
-    model, tokenizer, filepath="han_model.h5", tokenizer_path="tokenizer.pickle"
+    model,
+    tokenizer,
+    filepath="models/han_model.h5",
+    tokenizer_path="models/tokenizer.pickle",
 ):
     """
     Save the model and tokenizer
@@ -308,6 +358,9 @@ def save_model(
         return
 
     try:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
         # Save the model
         model.save(filepath)
         print(f"Model saved to {filepath}")
@@ -377,6 +430,10 @@ def main():
     print("Loading and preprocessing data...")
     # Use your dataset path here
     data_path = "./cwe_clean2.pkl"  # Replace with your actual path
+    # Check if CSV version exists and use it preferentially
+    if os.path.exists("./cwe_clean2.csv"):
+        data_path = "./cwe_clean2.csv"
+        print("Using CSV version of the data")
 
     # For demonstration purposes, we'll skip loading from a file
     cwe_data = load_data(data_path)
