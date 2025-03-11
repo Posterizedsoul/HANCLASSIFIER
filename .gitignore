@@ -1,2 +1,4 @@
 constants.py/
 data/
+cuda/
+venv/
