@@ -53,6 +53,9 @@ from sklearn.metrics import (
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.preprocessing.text import Tokenizer
 import random
+import gc
+import psutil
+from multiprocessing import cpu_count
 
 # Optional: Download necessary NLTK data
 try:
@@ -347,7 +350,7 @@ def calculate_class_weights(y_data):
     # Get the number of classes
     n_classes = y_data.shape[1]
 
-    # Create a dictionary for class weights, but in the format Keras expects
+    # Create a dictionary for class weights for multi-output problems
     class_weights = {}
 
     for i in range(n_classes):
@@ -359,8 +362,8 @@ def calculate_class_weights(y_data):
             class_weight="balanced", classes=np.unique(class_values), y=class_values
         )
 
-        # Store as a simple dictionary with keys like "0" and "1" for each output
-        class_weights[i] = {0: weights[0], 1: weights[1]}
+        # Store as a simple dictionary (this is what Keras expects for each output)
+        class_weights[i] = {j: weights[j] for j in range(len(weights))}
 
     print("Calculated class weights to handle imbalance:")
     for i, weights in class_weights.items():
@@ -580,9 +583,12 @@ def train_enhanced_model(
     batch_size=32,
     use_augmentation=True,
     handle_imbalance=True,
+    max_memory_percent=80,
+    num_cores=None,
 ):
     """
-    Train an enhanced model with options for data augmentation and handling class imbalance
+    Train an enhanced model with options for data augmentation, handling class imbalance,
+    and resource management
 
     Args:
         X_data: Processed text data
@@ -592,12 +598,35 @@ def train_enhanced_model(
         batch_size: Batch size
         use_augmentation: Whether to use data augmentation
         handle_imbalance: Whether to use class weights for imbalanced data
+        max_memory_percent: Maximum percentage of system memory to use
+        num_cores: Number of CPU cores to use (None = auto-detect)
 
     Returns:
         Trained model and history
     """
     if X_data is None or y_data is None:
         return None, None
+
+    # Configure CPU usage
+    if num_cores is None:
+        # Use all available cores except one to keep system responsive
+        available_cores = max(1, cpu_count() - 1)
+    else:
+        available_cores = num_cores
+
+    print(f"Configuring TensorFlow to use {available_cores} CPU cores")
+    tf.config.threading.set_intra_op_parallelism_threads(available_cores)
+    tf.config.threading.set_inter_op_parallelism_threads(available_cores)
+
+    # Monitor memory usage
+    total_memory = psutil.virtual_memory().total
+    max_memory_bytes = int(total_memory * max_memory_percent / 100)
+    print(
+        f"Limiting memory usage to {max_memory_percent}% of system memory ({max_memory_bytes / (1024**3):.2f} GB)"
+    )
+
+    # Force garbage collection before starting
+    gc.collect()
 
     # Use tuned parameters or defaults
     params = best_params or {
@@ -611,6 +640,9 @@ def train_enhanced_model(
     X_train, X_test, y_train, y_test = train_test_split(
         X_data, y_data, test_size=0.2, random_state=42
     )
+
+    # Force garbage collection to free memory
+    gc.collect()
 
     # Data augmentation for training set
     if use_augmentation:
@@ -627,10 +659,42 @@ def train_enhanced_model(
         X_train_augmented = X_train
         y_train_augmented = y_train
 
-    # Calculate class weights if handling imbalance
-    class_weight = None
+    # Handle class weights differently - FIXING THE ERROR
+    sample_weights = None
     if handle_imbalance:
-        class_weight = calculate_class_weights(y_train_augmented)
+        print("Calculating sample weights for imbalanced classes...")
+        # Instead of using class_weight parameter which is causing the error,
+        # we'll use sample_weight which is more flexible
+
+        # Get the number of classes
+        n_classes = y_train_augmented.shape[1]
+
+        # Create sample weights (all samples equally weighted initially)
+        sample_weights = np.ones(len(y_train_augmented))
+
+        # Adjust weights based on class distribution for each output
+        for i in range(n_classes):
+            class_values = y_train_augmented[:, i]
+            # Calculate class weights
+            class_counts = np.bincount(class_values.astype(int))
+            total = len(class_values)
+            # More weight to underrepresented class
+            class_weights_i = {
+                0: total / (2 * class_counts[0]) if class_counts[0] > 0 else 1.0,
+                1: total / (2 * class_counts[1]) if class_counts[1] > 0 else 1.0,
+            }
+            print(f"  Class {i} weights: {class_weights_i}")
+
+            # Apply class weights to sample weights
+            for j, y in enumerate(class_values):
+                sample_weights[j] *= class_weights_i[int(y)]
+
+        # Normalize sample weights
+        if sample_weights.sum() > 0:
+            sample_weights = sample_weights * len(sample_weights) / sample_weights.sum()
+
+    # Force garbage collection again
+    gc.collect()
 
     # Build model with tuned parameters
     max_words = 10000  # These should match your data prep parameters
@@ -658,6 +722,23 @@ def train_enhanced_model(
         ],
     )
 
+    # Add memory monitoring callback
+    class MemoryMonitor(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            # Check memory usage
+            used_memory = psutil.virtual_memory().used
+            memory_percent = (used_memory / total_memory) * 100
+            print(
+                f"Memory usage: {memory_percent:.1f}% ({used_memory / (1024**3):.2f} GB)"
+            )
+
+            # Run garbage collection if memory usage is high
+            if (
+                memory_percent > max_memory_percent * 0.9
+            ):  # If reaching 90% of our limit
+                print("High memory usage detected, running garbage collection...")
+                gc.collect()
+
     # Callbacks for improved training
     callbacks = [
         # Early stopping
@@ -673,29 +754,99 @@ def train_enhanced_model(
             save_best_only=True,
             verbose=1,
         ),
+        # Memory monitoring
+        MemoryMonitor(),
     ]
 
-    # Train the model with callbacks and class weights
-    history = model.fit(
-        X_train_augmented,
-        y_train_augmented,
-        epochs=epochs,
-        batch_size=batch_size,
-        validation_split=0.2,
-        callbacks=callbacks,
-        class_weight=class_weight,
-        verbose=1,
-    )
+    # Calculate batch size based on available memory
+    # Start with user-specified batch size but adjust if needed
+    current_batch_size = batch_size
+
+    # If batch size is too large, reduce it based on memory usage estimate
+    used_memory_before_fit = psutil.virtual_memory().used
+    estimated_batch_memory = (
+        X_train_augmented.nbytes / len(X_train_augmented) * current_batch_size * 4
+    )  # rough estimate
+    if used_memory_before_fit + estimated_batch_memory > max_memory_bytes:
+        # Adjust batch size to fit in memory
+        memory_headroom = max_memory_bytes - used_memory_before_fit
+        new_batch_size = max(
+            1,
+            int(
+                memory_headroom
+                / (X_train_augmented.nbytes / len(X_train_augmented) * 4)
+            ),
+        )
+        print(
+            f"Adjusting batch size from {current_batch_size} to {new_batch_size} to fit in memory limits"
+        )
+        current_batch_size = new_batch_size
+
+    # Train the model with callbacks and sample weights - using a try/except pattern for resiliency
+    try:
+        print(f"Training with batch size: {current_batch_size}")
+        history = model.fit(
+            X_train_augmented,
+            y_train_augmented,
+            epochs=epochs,
+            batch_size=current_batch_size,
+            validation_split=0.2,
+            callbacks=callbacks,
+            sample_weight=sample_weights,
+            verbose=1,
+        )
+    except (tf.errors.ResourceExhaustedError, tf.errors.InternalError, MemoryError):
+        # If we run out of memory, try with a smaller batch size
+        gc.collect()
+        smaller_batch = max(1, current_batch_size // 2)
+        print(f"Memory error. Retrying with smaller batch size: {smaller_batch}")
+        try:
+            history = model.fit(
+                X_train_augmented,
+                y_train_augmented,
+                epochs=epochs,
+                batch_size=smaller_batch,
+                validation_split=0.2,
+                callbacks=callbacks,
+                sample_weight=sample_weights,
+                verbose=1,
+            )
+        except (tf.errors.ResourceExhaustedError, tf.errors.InternalError, MemoryError):
+            # If still failing, try with an even smaller batch size
+            gc.collect()
+            smallest_batch = max(1, smaller_batch // 2)
+            print(
+                f"Still having memory issues. Final attempt with batch size: {smallest_batch}"
+            )
+            history = model.fit(
+                X_train_augmented,
+                y_train_augmented,
+                epochs=epochs,
+                batch_size=smallest_batch,
+                validation_split=0.2,
+                callbacks=callbacks,
+                sample_weight=sample_weights,
+                verbose=1,
+            )
+
+    # Force garbage collection before evaluation
+    gc.collect()
 
     # Evaluate the model
     print("\nEvaluating model on test set:")
-    test_results = model.evaluate(X_test, y_test, verbose=1)
+    test_results = model.evaluate(
+        X_test, y_test, verbose=1, batch_size=max(1, current_batch_size // 2)
+    )
     print(f"Test Loss: {test_results[0]:.4f}")
     print(f"Test Accuracy: {test_results[1]:.4f}")
 
     # Detailed evaluation for multilabel classification
     print("\nDetailed Performance Metrics:")
-    y_pred = model.predict(X_test)
+
+    # Use smaller batches for prediction to avoid memory issues
+    prediction_batch_size = max(1, current_batch_size // 2)
+    print(f"Using batch size {prediction_batch_size} for predictions")
+    y_pred = model.predict(X_test, batch_size=prediction_batch_size, verbose=1)
     y_pred_binary = (y_pred > 0.5).astype(int)
 
     # Per-class metrics
@@ -707,6 +858,9 @@ def train_enhanced_model(
         cm = confusion_matrix(y_test[:, i], y_pred_binary[:, i])
         print(f"Class {i} Confusion Matrix:")
         print(cm)
+
+    # Final garbage collection
+    gc.collect()
 
     return model, history
 
@@ -991,6 +1145,40 @@ def main_enhanced():
     MAX_WORDS = 10000
     MAX_SENT_LEN = 100
     MAX_SENT = 15
+    try:
+        total_cores = cpu_count()
+        suggested_cores = max(1, total_cores - 1)  # Leave one core free
+        cores_input = input(
+            f"Number of CPU cores to use (1-{total_cores}, default: {suggested_cores}): "
+        )
+        if cores_input.strip():
+            num_cores = int(cores_input)
+            if num_cores < 1 or num_cores > total_cores:
+                print(f"Invalid number of cores. Using default: {suggested_cores}")
+                num_cores = suggested_cores
+        else:
+            num_cores = suggested_cores
+    except:
+        print("Error determining CPU count. Using default configuration.")
+        num_cores = None  # Auto-detect
+
+    # Ask user about memory limit
+    try:
+        total_memory_gb = psutil.virtual_memory().total / (1024**3)
+        memory_input = input(f"Maximum memory usage percentage (10-90, default: 80): ")
+        if memory_input.strip():
+            max_memory = int(memory_input)
+            if max_memory < 10 or max_memory > 90:
+                print("Invalid memory percentage. Using default: 80%")
+                max_memory = 80
+        else:
+            max_memory = 80
+        print(
+            f"Will aim to keep memory usage under {max_memory}% of system memory ({total_memory_gb * max_memory / 100:.2f} GB)"
+        )
+    except:
+        print("Error determining system memory. Using default 80% limit.")
+        max_memory = 80
 
     print("Loading and preprocessing data...")
     data_path = "./cwe_clean2.pkl"  # Replace with your actual path
@@ -1041,10 +1229,12 @@ def main_enhanced():
         X_data,
         y_data,
         best_params=best_params,
-        epochs=15,  # Default to more epochs with early stopping
+        epochs=15,
         batch_size=32,
         use_augmentation=use_augmentation,
         handle_imbalance=handle_imbalance,
+        max_memory_percent=max_memory,
+        num_cores=num_cores,
     )
 
     # Comprehensive evaluation
@@ -1072,7 +1262,7 @@ def main_enhanced():
     # Additional model info to save
     model_info = {
         "class_names": class_names,
-        "creation_date": "2025-03-11 12:50:33",
+        "creation_date": "2025-03-20 09:51:52",
         "creator": "Posterizedsoul",
         "parameters": {
             "max_words": MAX_WORDS,
