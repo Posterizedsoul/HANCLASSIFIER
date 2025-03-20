@@ -5,7 +5,7 @@ Enhanced HAN (Hierarchical Attention Network) Classifier for CWE Data with Multi
 # Force CPU-only mode to avoid GPU errors
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 # Suppress TensorFlow logging except for errors
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
@@ -336,18 +336,18 @@ def augment_text_data(texts, labels, augmentation_factor=2):
 
 def calculate_class_weights(y_data):
     """
-    Calculate class weights for imbalanced datasets
+    Calculate class weights for imbalanced datasets for multi-label problems
 
     Args:
         y_data: Label data as a 2D array with shape (samples, classes)
 
     Returns:
-        Dictionary of class weights
+        Dictionary of class weights formatted for Keras
     """
-    # Get the number of samples for each class
-    n_samples = len(y_data)
+    # Get the number of classes
     n_classes = y_data.shape[1]
 
+    # Create a dictionary for class weights, but in the format Keras expects
     class_weights = {}
 
     for i in range(n_classes):
@@ -359,9 +359,8 @@ def calculate_class_weights(y_data):
             class_weight="balanced", classes=np.unique(class_values), y=class_values
         )
 
-        # Create a dictionary mapping each class to its weight
-        class_weight_dict = {0: weights[0], 1: weights[1]}
-        class_weights[i] = class_weight_dict
+        # Store as a simple dictionary with keys like "0" and "1" for each output
+        class_weights[i] = {0: weights[0], 1: weights[1]}
 
     print("Calculated class weights to handle imbalance:")
     for i, weights in class_weights.items():

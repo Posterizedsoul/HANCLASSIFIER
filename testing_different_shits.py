@@ -682,7 +682,10 @@ def train_enhanced_model(
         batch_size=batch_size,
         validation_split=0.2,
         callbacks=callbacks,
-        class_weight=class_weight,
+        # Use a list to properly map class weights to each output
+        class_weight=[class_weight[i] for i in range(len(class_weight))]
+        if class_weight
+        else None,
         verbose=1,
     )
 
