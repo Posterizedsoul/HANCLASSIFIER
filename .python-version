@@ -1,1 +1,434 @@
-.venv
+
+
+"""
+Enhanced HAN (Hierarchical Attention Network) Classifier for CWE Data with Multilabel Support
+"""
+
+# Force CPU-only mode to avoid GPU errors
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+# Suppress TensorFlow logging except for errors
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# Import necessary libraries
+import tensorflow as tf
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from keras.layers import (
+    Input,
+    Embedding,
+    LSTM,
+    Dense,
+    Dropout,
+    SpatialDropout1D,
+    Bidirectional,
+    GRU,
+    Flatten,
+)
+from keras.layers import (
+    TimeDistributed,
+    concatenate,
+    GlobalMaxPooling1D,
+    GlobalAveragePooling1D,
+)
+from keras.models import Model
+from keras.callbacks import EarlyStopping
+from keras.optimizers import Adam
+import numpy as np
+import pandas as pd
+import nltk
+from nltk.corpus import stopwords
+from nltk.corpus import wordnet
+import pickle
+import copy
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.preprocessing.text import Tokenizer
+import random
+
+# Optional: Download necessary NLTK data
+try:
+    nltk.download('stopwords', quiet=True)
+    nltk.download('wordnet', quiet=True)
+except:
+    print("Note: NLTK downloads may be needed for full functionality")
+
+# Load data
+def load_data(filepath):
+    """
+    Load the CWE data from a pickle or CSV file
+
+    Args:
+        filepath: Path to the data file
+
+    Returns:
+        DataFrame containing the CWE data
+    """
+    try:
+        # Try if it's a CSV file
+        if filepath.endswith('.csv'):
+            cwe_data = pd.read_csv(filepath)
+            print("Data loaded successfully from CSV!")
+            print(cwe_data.head())
+            return cwe_data
+
+        # Try standard pickle loading
+        cwe_data = pd.read_pickle(filepath)
+        print("Data loaded successfully from pickle!")
+        print(cwe_data.head())
+        return cwe_data
+    except Exception as e:
+        print(f"Standard loading failed: {e}")
+        try:
+            # Fallback to a more robust loading method
+            with open(filepath, "rb") as f:
+                import pickle
+                raw_data = pickle.load(f)
+
+            # If it's already a DataFrame, use it
+            if isinstance(raw_data, pd.DataFrame):
+                cwe_data = raw_data
+            else:
+                # Otherwise try to construct a DataFrame
+                cwe_data = pd.DataFrame(raw_data)
+
+            print("Data loaded using fallback method!")
+            print(cwe_data.head())
+            return cwe_data
+        except Exception as e2:
+            print(f"Fallback loading failed: {e2}")
+            print("Please convert your data to CSV format for more reliable loading.")
+            return None
+
+
+def preprocess_data(cwe_data):
+    """
+    Preprocess the data by dropping unwanted columns and filtering for specific labels
+
+    Args:
+        cwe_data: DataFrame containing the CWE data
+
+    Returns:
+        Preprocessed DataFrame
+    """
+    if cwe_data is None:
+        return None
+
+    # Deep copy for the next phase
+    cwe_deepcopy = copy.deepcopy(cwe_data)
+
+    # Only drop columns that exist in the dataframe
+    columns_to_drop = [
+        "Authorization",
+        "Accountability",
+        "Authentication",
+        "Non_Repudiation",
+        "Availability",
+        "Confidentiality",
+        "Other",
+    ]
+
+    # Filter the list to only include columns that actually exist
+    existing_columns = [col for col in columns_to_drop if col in cwe_deepcopy.columns]
+
+    # Only attempt to drop if there are columns to drop
+    if existing_columns:
+        cwe_deepcopy.drop(existing_columns, axis=1, inplace=True)
+
+    # Created a new df ignoring multi tags and only selecting with a single tag
+    cwe_df = cwe_deepcopy
+
+    # Make sure the column exists before processing
+    if "common_consequences_scope" in cwe_df.columns:
+        # Convert list to string for easier comparison
+        cwe_df["common_consequences_scope"] = cwe_df["common_consequences_scope"].apply(
+            lambda x: "".join(x) if isinstance(x, list) else x
+        )
+
+        # Get index to drop the index which has more than 1 label
+        dropIndex = cwe_df[
+            (cwe_df["common_consequences_scope"] != "Access Control")
+            & (cwe_df["common_consequences_scope"] != "Integrity")
+        ].index
+
+        # Drop the row by index if has more than 1 label
+        cwe_df.drop(index=dropIndex, inplace=True)
+
+        print(f"After preprocessing: {cwe_df.shape[0]} records")
+        print(f"Unique labels: {cwe_df['common_consequences_scope'].unique()}")
+    else:
+        print("Warning: 'common_consequences_scope' column not found in dataframe")
+
+    # Save in CSV format for more reliable future loading
+    try:
+        cwe_df.to_csv("cwe_clean2.csv", index=False)
+        print("Data saved to CSV for future use")
+    except Exception as e:
+        print(f"Error saving CSV: {e}")
+
+    return cwe_df
+
+
+def prepare_text_data(cwe_df, max_words=10000, max_sent_len=100, max_sent=15):
+    """
+    Prepare text data for HAN model by tokenizing and padding
+
+    Args:
+        cwe_df: Preprocessed DataFrame
+        max_words: Maximum number of words to keep in the vocabulary
+        max_sent_len: Maximum length of each sentence
+        max_sent: Maximum number of sentences
+
+    Returns:
+        X_data: Processed text data
+        y_data: Labels
+        tokenizer: Fitted tokenizer
+    """
+    if cwe_df is None:
+        return None, None, None
+
+    # Use Clean_Description column as text data
+    texts = cwe_df["Clean_Description"].values
+
+    # Split texts into sentences and words
+    # For HAN model, we need data in the format of [samples, sentences, words]
+    documents = []
+    for text in texts:
+        # Simple sentence splitting (adjust as needed)
+        sentences = text.split(". ")
+        document = []
+        for sentence in sentences[:max_sent]:
+            words = sentence.split()
+            document.append(words[:max_sent_len])
+        # Pad document with empty sentences if needed
+        while len(document) < max_sent:
+            document.append([])
+        documents.append(document)
+
+    # Create and fit tokenizer
+    tokenizer = Tokenizer(num_words=max_words)
+    all_words = " ".join(texts)
+    tokenizer.fit_on_texts([all_words])
+
+    # Convert words to sequences
+    data = np.zeros((len(documents), max_sent, max_sent_len), dtype="int32")
+    for i, document in enumerate(documents):
+        for j, sentence in enumerate(document):
+            if sentence:
+                seq = tokenizer.texts_to_sequences([" ".join(sentence)])[0]
+                for k, word in enumerate(seq):
+                    if k < max_sent_len:
+                        data[i, j, k] = word
+
+    # Prepare labels (convert to categorical)
+    # Assuming 'Access_Control' and 'Integrity' are binary columns (0/1)
+    labels = cwe_df[["Access_Control", "Integrity"]].values
+
+    return data, labels, tokenizer
+
+
+def augment_text_data(texts, labels, augmentation_factor=2):
+    """
+    Perform simple NLP data augmentation to increase training data
+
+    Args:
+        texts: Original text data
+        labels: Corresponding labels
+        augmentation_factor: How many augmented samples to create per original
+
+    Returns:
+        Augmented texts and labels
+    """
+    try:
+        wordnet.ensure_loaded()
+    except:
+        try:
+            nltk.download('wordnet', quiet=True)
+        except:
+            print("Warning: Could not download wordnet. Simple augmentation will be used.")
+
+    augmented_texts = list(texts)
+    augmented_labels = list(labels)
+
+    # Define simple augmentation techniques
+    def synonym_replacement(text, n=2):
+        words = text.split()
+        if len(words) <= n:
+            return text
+
+        # Get positions to replace (avoid replacing more than n words)
+        positions = random.sample(range(len(words)), min(n, len(words)))
+
+        for pos in positions:
+            word = words[pos]
+            # Try to find synonyms
+            synonyms = []
+            try:
+                for syn in wordnet.synsets(word):
+                    for lemma in syn.lemmas():
+                        if lemma.name() != word and "_" not in lemma.name():
+                            synonyms.append(lemma.name())
+            except:
+                continue
+
+            # If synonyms found, replace word
+            if synonyms:
+                words[pos] = random.choice(synonyms)
+
+        return " ".join(words)
+
+    def random_swap(text, n=2):
+        words = text.split()
+        if len(words) <= 1:
+            return text
+
+        for _ in range(min(n, len(words))):
+            pos1, pos2 = random.sample(range(len(words)), 2)
+            words[pos1], words[pos2] = words[pos2], words[pos1]
+
+        return " ".join(words)
+
+    def random_deletion(text, p=0.1):
+        words = text.split()
+        if len(words) <= 3:
+            return text
+
+        kept_words = []
+        for word in words:
+            if random.random() > p:
+                kept_words.append(word)
+
+        if len(kept_words) == 0:
+            return text
+
+        return " ".join(kept_words)
+
+    # Apply augmentation
+    for i, (text, label) in enumerate(zip(texts, labels)):
+        for _ in range(augmentation_factor):
+            # Choose a random augmentation technique
+            technique = random.choice([synonym_replacement, random_swap, random_deletion])
+            augmented_text = technique(text)
+
+            # Add augmented sample
+            augmented_texts.append(augmented_text)
+            augmented_labels.append(label)
+
+    print(f"Data augmented: {len(texts)} original samples → {len(augmented_texts)} total samples")
+    return np.array(augmented_texts), np.array(augmented_labels)
+
+
+def calculate_class_weights(y_data):
+    """
+    Calculate class weights for imbalanced datasets
+
+    Args:
+        y_data: Label data as a 2D array with shape (samples, classes)
+
+    Returns:
+        Dictionary of class weights
+    """
+    # Get the number of samples for each class
+    n_samples = len(y_data)
+    n_classes = y_data.shape[1]
+
+    class_weights = {}
+
+    for i in range(n_classes):
+        # Get binary class values (0 or 1)
+        class_values = y_data[:, i]
+
+        # Calculate class weights using sklearn utility
+        weights = compute_class_weight(
+            class_weight='balanced',
+            classes=np.unique(class_values),
+            y=class_values
+        )
+
+        # Create a dictionary mapping each class to its weight
+        class_weight_dict = {0: weights[0], 1: weights[1]}
+        class_weights[i] = class_weight_dict
+
+    print("Calculated class weights to handle imbalance:")
+    for i, weights in class_weights.items():
+        print(f"  Class {i}: {weights}")
+
+    return class_weights
+
+
+def build_han_model_tunable(
+    max_words, max_sent_len, max_sent,
+    embedding_dim=100, lstm_units=100, dropout_rate=0.3
+):
+    """
+    Build an enhanced Hierarchical Attention Network model with dropout
+
+    Args:
+        max_words: Maximum vocabulary size
+        max_sent_len: Maximum length of sentences
+        max_sent: Maximum number of sentences
+        embedding_dim: Dimension of embedding layer
+        lstm_units: Number of LSTM units
+        dropout_rate: Dropout rate for regularization
+
+    Returns:
+        Compiled HAN model
+    """
+    # Word level
+    word_input = Input(shape=(max_sent_len,), dtype="int32")
+    word_embedding = Embedding(
+        input_dim=max_words, output_dim=embedding_dim
+    )(word_input)
+
+    # Add dropout after embedding
+    word_embedding = SpatialDropout1D(dropout_rate)(word_embedding)
+
+    word_lstm = Bidirectional(LSTM(lstm_units, return_sequences=True))(word_embedding)
+    word_dense = TimeDistributed(Dense(lstm_units * 2, activation="relu"))(word_lstm)
+
+    # Add dropout after dense layer
+    word_dense = TimeDistributed(Dropout(dropout_rate))(word_dense)
+
+    word_att = TimeDistributed(Dense(1, activation="tanh"))(word_dense)
+    word_att = Flatten()(word_att)
+    word_att = tf.keras.layers.Activation('softmax')(word_att)
+    word_att = tf.keras.layers.Reshape((max_sent_len, 1))(word_att)
+    word_output = tf.keras.layers.Multiply()([word_lstm, word_att])
+    word_output = tf.keras.layers.Lambda(lambda x: tf.keras.backend.sum(x, axis=1))(word_output)
+
+    # Sentence level model
+    sent_encoder = Model(word_input, word_output)
+
+    # Document level
+    document_input = Input(shape=(max_sent, max_sent_len), dtype="int32")
+    document_encoder = TimeDistributed(sent_encoder)(document_input)
+    document_lstm = Bidirectional(LSTM(lstm_units, return_sequences=True))(
+        document_encoder
+    )
+
+    # Add dropout after LSTM
+    document_lstm = Dropout(dropout_rate)(document_lstm)
+
+    document_dense = TimeDistributed(Dense(lstm_units * 2, activation="relu"))(
+        document_lstm
+    )
+    document_att = TimeDistributed(Dense(1, activation="tanh"))(document_dense)
+    document_att = Flatten()(document_att)
+    document_att = tf.keras.layers.Activation('softmax')(document_att)
+    document_att = tf.keras.layers.Reshape((max_sent, 1))(document_att)
+    document_output = tf.keras.layers.Multiply()([document_lstm, document_att])
+    document_output = tf.keras.layers.Lambda(lambda x: tf.keras.backend.sum(x, axis=1))(document_output)
+
+    # Final dropout before output
+    document_output = Dropout(dropout_rate)(document_output)
+
+    # Output layer for multilabel classification
+    output = Dense(2, activation="sigmoid")(document_output)
+
+    # Final model
+    model = Model(inputs=document_input, outputs=output)
+
+    # Model will be compiled in the training function with appropriate parameters
+
+    return model
