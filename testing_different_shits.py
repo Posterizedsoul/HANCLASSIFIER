@@ -336,18 +336,18 @@ def augment_text_data(texts, labels, augmentation_factor=2):
 
 def calculate_class_weights(y_data):
     """
-    Calculate class weights for imbalanced datasets
+    Calculate class weights for imbalanced datasets for multi-label problems
 
     Args:
         y_data: Label data as a 2D array with shape (samples, classes)
 
     Returns:
-        Dictionary of class weights
+        Dictionary of class weights formatted for Keras
     """
-    # Get the number of samples for each class
-    n_samples = len(y_data)
+    # Get the number of classes
     n_classes = y_data.shape[1]
 
+    # Create a dictionary for class weights for multi-output problems
     class_weights = {}
 
     for i in range(n_classes):
@@ -359,9 +359,8 @@ def calculate_class_weights(y_data):
             class_weight="balanced", classes=np.unique(class_values), y=class_values
         )
 
-        # Create a dictionary mapping each class to its weight
-        class_weight_dict = {0: weights[0], 1: weights[1]}
-        class_weights[i] = class_weight_dict
+        # Store as a simple dictionary (this is what Keras expects for each output)
+        class_weights[i] = {j: weights[j] for j in range(len(weights))}
 
     print("Calculated class weights to handle imbalance:")
     for i, weights in class_weights.items():
@@ -631,29 +630,8 @@ def train_enhanced_model(
     # Calculate class weights if handling imbalance
     class_weights = None
     if handle_imbalance:
-        # Modified way to handle class weights that works with Keras
-        print("Calculating class weights to handle imbalance...")
-
-        # For each output in the model (Access_Control and Integrity)
-        n_classes = y_train_augmented.shape[1]
-        class_weight_list = []
-
-        for i in range(n_classes):
-            # Get binary class values (0 or 1) for this output
-            class_values = y_train_augmented[:, i]
-
-            # Calculate class weights using sklearn utility
-            weights = compute_class_weight(
-                class_weight="balanced", classes=np.unique(class_values), y=class_values
-            )
-
-            print(f"  Class {i}: Weight ratio {weights[1] / weights[0]:.4f} (1:{0})")
-            class_weight_list.append({0: weights[0], 1: weights[1]})
-
-        # We'll handle class weights manually through sample_weight instead
-        sample_weight = np.ones(len(X_train_augmented))
-        # You can implement custom sample weight logic here if needed
-        # This is a simple approach that avoids the error
+        # Modified: Store the result in class_weights (not class_weight)
+        class_weights = calculate_class_weights(y_train_augmented)
 
     # Build model with tuned parameters
     max_words = 10000  # These should match your data prep parameters
@@ -698,32 +676,31 @@ def train_enhanced_model(
         ),
     ]
 
-    # Train the model with callbacks WITHOUT problematic class weights
+    # Fixed: We need to modify the class_weights structure to be compatible with Keras
+    modified_class_weights = None
+    if handle_imbalance and class_weights is not None:
+        # Convert to format Keras expects for multi-output models
+        # Each output node gets its own class weight dictionary
+        modified_class_weights = {}
+        for i in range(y_data.shape[1]):  # For each output class
+            if i in class_weights:
+                modified_class_weights[i] = class_weights[i]
 
-    if handle_imbalance:
-        # Just use standard training without the problematic class weights
-        sample_weight = np.ones(len(X_train_augmented))  # Equal weights for all samples
-        history = model.fit(
-            X_train_augmented,
-            y_train_augmented,
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_split=0.2,
-            callbacks=callbacks,
-            sample_weight=sample_weight,  # Use sample_weight instead of class_weight
-            verbose=1,
-        )
-    else:
-        # Standard training without weights
-        history = model.fit(
-            X_train_augmented,
-            y_train_augmented,
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_split=0.2,
-            callbacks=callbacks,
-            verbose=1,
-        )
+    # Train the model with callbacks and class weights
+    print(
+        "-------------Modified Class Weights-------------------",
+        modified_class_weights,
+    )
+    history = model.fit(
+        X_train_augmented,
+        y_train_augmented,
+        epochs=epochs,
+        batch_size=batch_size,
+        validation_split=0.2,
+        callbacks=callbacks,
+        class_weight=modified_class_weights,  # Fixed: Use modified_class_weights
+        verbose=1,
+    )
     # Evaluate the model
     print("\nEvaluating model on test set:")
     test_results = model.evaluate(X_test, y_test, verbose=1)
